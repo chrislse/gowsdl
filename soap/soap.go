@@ -6,6 +6,8 @@ import (
 	"crypto/tls"
 	"encoding/xml"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -21,15 +23,9 @@ type SOAPDecoder interface {
 }
 
 type SOAPEnvelope struct {
-	XMLName xml.Name `xml:"http://schemas.xmlsoap.org/soap/envelope/ Envelope"`
-	Header  *SOAPHeader
+	XMLName xml.Name      `xml:"http://schemas.xmlsoap.org/soap/envelope/ Envelope"`
+	Headers []interface{} `xml:"http://schemas.xmlsoap.org/soap/envelope/ Header"`
 	Body    SOAPBody
-}
-
-type SOAPHeader struct {
-	XMLName xml.Name `xml:"http://schemas.xmlsoap.org/soap/envelope/ Header"`
-
-	Headers []interface{}
 }
 
 type SOAPBody struct {
@@ -169,6 +165,7 @@ type options struct {
 	client           HTTPClient
 	httpHeaders      map[string]string
 	mtom             bool
+	normalSoapXml    bool
 }
 
 var defaultOptions = options{
@@ -242,11 +239,23 @@ func WithMTOM() Option {
 	}
 }
 
+func WithNormalSoapXML() Option {
+	return func(o *options) {
+		o.normalSoapXml = true
+	}
+}
+
+type RequestEnvelopCallBack = func() RequestEnvelop
+type ResponseEnvelopCallBack = func() ResponseEnvelop
+
 // Client is soap client
 type Client struct {
 	url     string
 	opts    *options
 	headers []interface{}
+
+	RequestEnvelop  RequestEnvelopCallBack
+	ResponseEnvelop ResponseEnvelopCallBack
 }
 
 // HTTPClient is a client which can make HTTP requests
@@ -268,15 +277,8 @@ func NewClient(url string, opt ...Option) *Client {
 }
 
 // AddHeader adds envelope header
-// For correct behavior, every header must contain a `XMLName` field.  Refer to #121 for details
 func (s *Client) AddHeader(header interface{}) {
 	s.headers = append(s.headers, header)
-}
-
-// SetHeaders sets envelope headers, overwriting any existing headers.
-// For correct behavior, every header must contain a `XMLName` field.  Refer to #121 for details
-func (s *Client) SetHeaders(headers ...interface{}) {
-	s.headers = headers
 }
 
 // CallContext performs HTTP POST request with a context
@@ -289,16 +291,54 @@ func (s *Client) Call(soapAction string, request, response interface{}) error {
 	return s.call(context.Background(), soapAction, request, response)
 }
 
+type RequestEnvelop interface {
+	SetHeaders([]interface{})
+	SetBodyContent(interface{})
+}
+
+type ResponseEnvelop interface {
+	SetBodyContent(interface{})
+	GetFault() error
+}
+
+func (s *SOAPEnvelope) SetHeaders(headers []interface{}) {
+	s.Headers = headers
+}
+
+func (s *SOAPEnvelope) SetBodyContent(content interface{}) {
+	s.Body.Content = content
+}
+
+func (s *SOAPEnvelope) GetFault() error {
+	if s.Body.Fault == (*SOAPFault)(nil) {
+		return nil
+	}
+	return s.Body.Fault
+}
+
+func (s *Client) NewRequestEnvelop() RequestEnvelop {
+	if s.RequestEnvelop == nil {
+		return &SOAPEnvelope{}
+	}
+	return s.RequestEnvelop()
+}
+
+func (s *Client) NewResponseEnvelop() ResponseEnvelop {
+	if s.ResponseEnvelop == nil {
+		return &SOAPEnvelope{}
+	}
+	return s.ResponseEnvelop()
+}
+
 func (s *Client) call(ctx context.Context, soapAction string, request, response interface{}) error {
-	envelope := SOAPEnvelope{}
+	envelope := s.NewRequestEnvelop()
 
 	if s.headers != nil && len(s.headers) > 0 {
-		envelope.Header = &SOAPHeader{
-			Headers: s.headers,
-		}
-	}
+		envelope.SetHeaders(s.headers)
 
-	envelope.Body.Content = request
+	}
+	envelope.SetBodyContent(request)
+
 	buffer := new(bytes.Buffer)
 	var encoder SOAPEncoder
 	if s.opts.mtom {
@@ -326,10 +366,14 @@ func (s *Client) call(ctx context.Context, soapAction string, request, response 
 	req = req.WithContext(ctx)
 
 	if s.opts.mtom {
+		log.Println("mtom")
 		req.Header.Add("Content-Type", fmt.Sprintf(mtomContentType, encoder.(*mtomEncoder).Boundary()))
+	} else if s.opts.normalSoapXml {
+		req.Header.Add("Content-Type", "application/soap+xml; charset=\"utf-8\"")
 	} else {
 		req.Header.Add("Content-Type", "text/xml; charset=\"utf-8\"")
 	}
+
 	req.Header.Add("SOAPAction", soapAction)
 	req.Header.Set("User-Agent", "gowsdl/0.1")
 	if s.opts.httpHeaders != nil {
@@ -358,11 +402,12 @@ func (s *Client) call(ctx context.Context, soapAction string, request, response 
 	}
 	defer res.Body.Close()
 
-	respEnvelope := new(SOAPEnvelope)
-	respEnvelope.Body = SOAPBody{Content: response}
+	respEnvelope := s.NewResponseEnvelop()
+	respEnvelope.SetBodyContent(response)
 
 	mtomBoundary, err := getMtomHeader(res.Header.Get("Content-Type"))
 	if err != nil {
+
 		return err
 	}
 
@@ -370,14 +415,18 @@ func (s *Client) call(ctx context.Context, soapAction string, request, response 
 	if mtomBoundary != "" {
 		dec = newMtomDecoder(res.Body, mtomBoundary)
 	} else {
+
 		dec = xml.NewDecoder(res.Body)
 	}
 
 	if err := dec.Decode(respEnvelope); err != nil {
+		data, _ := ioutil.ReadAll(res.Body)
+		log.Println(string(data))
 		return err
 	}
 
-	fault := respEnvelope.Body.Fault
+	fault := respEnvelope.GetFault()
+
 	if fault != nil {
 		return fault
 	}
